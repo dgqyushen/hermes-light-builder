@@ -1,0 +1,209 @@
+name: Build Hermes Light (Windows x64)
+
+# Builds the unpublished "light" variant of Hermes Desktop: the remote-only
+# Electron client with no bundled Python, no local agent, no payload.
+#
+# Upstream ships `light` as a build target but has no release leg for it and
+# will not publish one (NousResearch/hermes-agent#102564). This repo is only a
+# CI host: it clones upstream at a tag, packs, and publishes a release.
+#
+# Everything runs on GitHub-hosted runners, which are free and unmetered for
+# public repositories. The 2-3 GB of build litter lives on a disposable VM.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream tag, e.g. v0.22.5. Blank = latest stable release."
+        type: string
+        required: false
+      force:
+        description: "Rebuild even if a release for this tag already exists."
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 19 * * *"   # 03:17 Asia/Shanghai, daily
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: win-light
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve upstream tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      needed: ${{ steps.resolve.outputs.needed }}
+    steps:
+      - name: Pick tag and check for an existing release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED:-}"
+          if [ -z "$tag" ]; then
+            tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          fi
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "Refusing unexpected tag: $tag" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "light-$tag" >/dev/null 2>&1; then
+            echo "Release light-$tag already exists; nothing to do."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Pack light (win-x64)
+    needs: resolve
+    if: needs.resolve.outputs.needed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Clone upstream at ${{ needs.resolve.outputs.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -c advice.detachedHead=false clone --depth 1 `
+            --branch "${{ needs.resolve.outputs.tag }}" `
+            https://github.com/NousResearch/hermes-agent.git src
+
+      - name: Install workspace dependencies
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --workspace apps/desktop --workspace apps/shared `
+            --include-workspace-root --no-audit --no-fund
+
+      - name: Pack the light variant
+        shell: pwsh
+        working-directory: src
+        env:
+          HERMES_DESKTOP_VARIANT: light
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run pack --workspace apps/desktop
+
+      - name: Assert the payload is absent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "src/apps/desktop/release/win-unpacked"
+          if (-not (Test-Path "$out/resources/app.asar")) { throw "app.asar is missing" }
+          if (Test-Path "$out/resources/agent-payload") { throw "light build contains an agent payload" }
+          Get-ChildItem $out -Filter *.exe | Select-Object Name, Length | Format-Table -AutoSize
+          "---"
+          "{0:N1} MB unpacked" -f ((Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Archive and hash
+        id: archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "${{ needs.resolve.outputs.tag }}"
+          $name = "Hermes-Light-$tag-win-x64.zip"
+          $zipPath = Join-Path (Get-Location) $name
+          $out = (Resolve-Path "src/apps/desktop/release/win-unpacked").Path
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          Push-Location $out
+          try {
+            if (Test-Path $sevenZip) {
+              & $sevenZip a -tzip -mx=9 $zipPath "*" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "7z failed with $LASTEXITCODE" }
+            } else {
+              Compress-Archive -Path "*" -DestinationPath $zipPath -CompressionLevel Optimal
+            }
+          } finally {
+            Pop-Location
+          }
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File "$name.sha256" -Encoding ascii -NoNewline
+
+          # The archive must be flat: the launcher sits at the root, not under a
+          # build path. A nested layout still "works" but ships a 6-level path
+          # to the user, so fail instead of publishing it.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $roots = $zip.Entries | ForEach-Object { ($_.FullName -split '/')[0] } | Sort-Object -Unique
+          } finally { $zip.Dispose() }
+          if (-not ($roots -contains 'Hermes Light.exe')) {
+            throw "archive is not flat; top-level entries: $($roots -join ', ')"
+          }
+
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "{0:N1} MB zip" -f ((Get-Item $zipPath).Length / 1MB)
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "${{ needs.resolve.outputs.tag }}"
+          $rel = "light-$tag"
+          $zip = "${{ steps.archive.outputs.name }}"
+          gh release view $rel *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $notes = @"
+          Unofficial Windows x64 build of the upstream Hermes Desktop ``light`` variant.
+
+          - Upstream tag: $tag
+          - Variant: light (remote-only; no Python, no local agent, no payload)
+          - Built by GitHub Actions on windows-latest from unmodified upstream source
+          - Unsigned: SmartScreen will warn, and Smart App Control will block it
+
+          Extract the whole ZIP, then run ``Hermes Light.exe``. Point it at a remote
+          gateway in Settings -> Gateways -> Remote gateway. Updates are manual:
+          download the next release.
+          "@
+            gh release create $rel --title "Hermes Light $tag (win-x64)" --notes $notes
+          }
+          gh release upload $rel $zip "$zip.sha256" --clobber
+
+  keepalive:
+    name: Keepalive
+    # GitHub disables scheduled workflows in public repos after 60 days without
+    # a commit. Workflow runs do not count as activity, so commit monthly.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch the keepalive stamp
+        run: |
+          set -euo pipefail
+          mkdir -p .keepalive
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > ".keepalive/$(date -u +%Y-%m).txt"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: keepalive $(date -u +%Y-%m)"
+          git push
