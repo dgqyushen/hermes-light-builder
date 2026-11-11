@@ -21,8 +21,8 @@ on:
         description: "Rebuild even if a release for this tag already exists."
         type: boolean
         default: false
-  schedule:
-    - cron: "17 19 * * *"   # 03:17 Asia/Shanghai, daily
+  # Daily schedule removed 2026-11-11: project is permanently idle. Manual runs
+  # must go through workflow_dispatch or by re-adding a cron here.
   push:
     paths:
       - ".github/workflows/build.yml"
